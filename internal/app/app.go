@@ -95,7 +95,7 @@ func New(ctx context.Context, conn *sql.DB, cfg *config.Config) (*App, error) {
 	app.initLSPClients(ctx)
 
 	// Check for updates in the background.
-	go app.checkForUpdates(ctx)
+	//go app.checkForUpdates(ctx)
 
 	go func() {
 		slog.Info("Initializing MCP clients")
