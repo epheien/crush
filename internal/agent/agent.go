@@ -27,7 +27,9 @@ import (
 	"charm.land/fantasy/providers/google"
 	"charm.land/fantasy/providers/openai"
 	"charm.land/fantasy/providers/openrouter"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/catwalk/pkg/catwalk"
+	"github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/agent/tools"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
@@ -65,6 +67,7 @@ type SessionAgent interface {
 	IsSessionBusy(sessionID string) bool
 	IsBusy() bool
 	QueuedPrompts(sessionID string) int
+	QueuedPromptsList(sessionID string) []string
 	ClearQueue(sessionID string)
 	Summarize(context.Context, string, fantasy.ProviderOptions) error
 	Model() Model
@@ -81,6 +84,7 @@ type sessionAgent struct {
 	smallModel           Model
 	systemPromptPrefix   string
 	systemPrompt         string
+	isSubAgent           bool
 	tools                []fantasy.AgentTool
 	sessions             session.Service
 	messages             message.Service
@@ -96,6 +100,7 @@ type SessionAgentOptions struct {
 	SmallModel           Model
 	SystemPromptPrefix   string
 	SystemPrompt         string
+	IsSubAgent           bool
 	DisableAutoSummarize bool
 	IsYolo               bool
 	Sessions             session.Service
@@ -111,6 +116,7 @@ func NewSessionAgent(
 		smallModel:           opts.SmallModel,
 		systemPromptPrefix:   opts.SystemPromptPrefix,
 		systemPrompt:         opts.SystemPrompt,
+		isSubAgent:           opts.IsSubAgent,
 		sessions:             opts.Sessions,
 		messages:             opts.Messages,
 		disableAutoSummarize: opts.DisableAutoSummarize,
@@ -165,10 +171,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	var wg sync.WaitGroup
 	// Generate title if first message.
 	if len(msgs) == 0 {
+		titleCtx := ctx // Copy to avoid race with ctx reassignment below.
 		wg.Go(func() {
-			sessionLock.Lock()
-			a.generateTitle(ctx, &currentSession, call.Prompt)
-			sessionLock.Unlock()
+			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
 		})
 	}
 
@@ -343,9 +348,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				finishReason = message.FinishReasonToolUse
 			}
 			currentAssistant.AddFinish(finishReason, "", "")
-			a.updateSessionUsage(a.largeModel, &currentSession, stepResult.Usage, a.openrouterCost(stepResult.ProviderMetadata))
 			sessionLock.Lock()
-			_, sessionErr := a.sessions.Save(genCtx, currentSession)
+			updatedSession, getSessionErr := a.sessions.Get(genCtx, call.SessionID)
+			if getSessionErr != nil {
+				sessionLock.Unlock()
+				return getSessionErr
+			}
+			a.updateSessionUsage(a.largeModel, &updatedSession, stepResult.Usage, a.openrouterCost(stepResult.ProviderMetadata))
+			_, sessionErr := a.sessions.Save(genCtx, updatedSession)
 			sessionLock.Unlock()
 			if sessionErr != nil {
 				return sessionErr
@@ -445,8 +455,22 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			currentAssistant.AddFinish(message.FinishReasonCanceled, "User canceled request", "")
 		} else if isPermissionErr {
 			currentAssistant.AddFinish(message.FinishReasonPermissionDenied, "User denied permission", "")
+		} else if errors.Is(err, hyper.ErrNoCredits) {
+			url := hyper.BaseURL()
+			link := lipgloss.NewStyle().Hyperlink(url, "id=hyper").Render(url)
+			currentAssistant.AddFinish(message.FinishReasonError, "No credits", "You're out of credits. Add more at "+link)
 		} else if errors.As(err, &providerErr) {
-			currentAssistant.AddFinish(message.FinishReasonError, cmp.Or(stringext.Capitalize(providerErr.Title), defaultTitle), providerErr.Message)
+			if providerErr.Message == "The requested model is not supported." {
+				url := "https://github.com/settings/copilot/features"
+				link := lipgloss.NewStyle().Hyperlink(url, "id=hyper").Render(url)
+				currentAssistant.AddFinish(
+					message.FinishReasonError,
+					"Copilot model not enabled",
+					fmt.Sprintf("%q is not enabled in Copilot. Go to the following page to enable it. Then, wait a minute before trying again. %s", a.largeModel.CatwalkCfg.Name, link),
+				)
+			} else {
+				currentAssistant.AddFinish(message.FinishReasonError, cmp.Or(stringext.Capitalize(providerErr.Title), defaultTitle), providerErr.Message)
+			}
 		} else if errors.As(err, &fantasyErr) {
 			currentAssistant.AddFinish(message.FinishReasonError, cmp.Or(stringext.Capitalize(fantasyErr.Title), defaultTitle), fantasyErr.Message)
 		} else {
@@ -531,8 +555,18 @@ func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fan
 		return err
 	}
 
+	summaryPromptText := "Provide a detailed summary of our conversation above."
+	if len(currentSession.Todos) > 0 {
+		summaryPromptText += "\n\n## Current Todo List\n\n"
+		for _, t := range currentSession.Todos {
+			summaryPromptText += fmt.Sprintf("- [%s] %s\n", t.Status, t.Content)
+		}
+		summaryPromptText += "\nInclude these tasks and their statuses in your summary. "
+		summaryPromptText += "Instruct the resuming assistant to use the `todos` tool to continue tracking progress on these tasks."
+	}
+
 	resp, err := agent.Stream(genCtx, fantasy.AgentStreamCall{
-		Prompt:          "Provide a detailed summary of our conversation above.",
+		Prompt:          summaryPromptText,
 		Messages:        aiMsgs,
 		ProviderOptions: opts,
 		PrepareStep: func(callContext context.Context, options fantasy.PrepareStepFunctionOptions) (_ context.Context, prepared fantasy.PrepareStepResult, err error) {
@@ -633,6 +667,15 @@ func (a *sessionAgent) createUserMessage(ctx context.Context, call SessionAgentC
 
 func (a *sessionAgent) preparePrompt(msgs []message.Message, attachments ...message.Attachment) ([]fantasy.Message, []fantasy.FilePart) {
 	var history []fantasy.Message
+	if !a.isSubAgent {
+		history = append(history, fantasy.NewUserMessage(
+			fmt.Sprintf("<system_reminder>%s</system_reminder>",
+				`This is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware.
+If you are working on tasks that would benefit from a todo list please use the "todos" tool to create one.
+If not, please feel free to ignore. Again do not mention this message to the user.`,
+			),
+		))
+	}
 	for _, m := range msgs {
 		if len(m.Parts) == 0 {
 			continue
@@ -679,7 +722,7 @@ func (a *sessionAgent) getSessionMessages(ctx context.Context, session session.S
 	return msgs, nil
 }
 
-func (a *sessionAgent) generateTitle(ctx context.Context, session *session.Session, prompt string) {
+func (a *sessionAgent) generateTitle(ctx context.Context, sessionID string, prompt string) {
 	if prompt == "" {
 		return
 	}
@@ -724,8 +767,7 @@ func (a *sessionAgent) generateTitle(ctx context.Context, session *session.Sessi
 		return
 	}
 
-	session.Title = title
-
+	// Calculate usage and cost.
 	var openrouterCost *float64
 	for _, step := range resp.Steps {
 		stepCost := a.openrouterCost(step.ProviderMetadata)
@@ -738,8 +780,27 @@ func (a *sessionAgent) generateTitle(ctx context.Context, session *session.Sessi
 		}
 	}
 
-	a.updateSessionUsage(a.smallModel, session, resp.TotalUsage, openrouterCost)
-	_, saveErr := a.sessions.Save(ctx, *session)
+	modelConfig := a.smallModel.CatwalkCfg
+	cost := modelConfig.CostPer1MInCached/1e6*float64(resp.TotalUsage.CacheCreationTokens) +
+		modelConfig.CostPer1MOutCached/1e6*float64(resp.TotalUsage.CacheReadTokens) +
+		modelConfig.CostPer1MIn/1e6*float64(resp.TotalUsage.InputTokens) +
+		modelConfig.CostPer1MOut/1e6*float64(resp.TotalUsage.OutputTokens)
+
+	if a.isClaudeCode() {
+		cost = 0
+	}
+
+	// Use override cost if available (e.g., from OpenRouter).
+	if openrouterCost != nil {
+		cost = *openrouterCost
+	}
+
+	promptTokens := resp.TotalUsage.InputTokens + resp.TotalUsage.CacheCreationTokens
+	completionTokens := resp.TotalUsage.OutputTokens + resp.TotalUsage.CacheReadTokens
+
+	// Atomically update only title and usage fields to avoid overriding other
+	// concurrent session updates.
+	saveErr := a.sessions.UpdateTitleAndUsage(ctx, sessionID, title, promptTokens, completionTokens, cost)
 	if saveErr != nil {
 		slog.Error("failed to save session title & usage", "error", saveErr)
 		return
@@ -849,6 +910,18 @@ func (a *sessionAgent) QueuedPrompts(sessionID string) int {
 		return 0
 	}
 	return len(l)
+}
+
+func (a *sessionAgent) QueuedPromptsList(sessionID string) []string {
+	l, ok := a.messageQueue.Get(sessionID)
+	if !ok {
+		return nil
+	}
+	prompts := make([]string, len(l))
+	for i, call := range l {
+		prompts[i] = call.Prompt
+	}
+	return prompts
 }
 
 func (a *sessionAgent) SetModels(large Model, small Model) {

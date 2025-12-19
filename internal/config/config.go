@@ -5,19 +5,25 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/catwalk/pkg/catwalk"
+	hyperp "github.com/charmbracelet/crush/internal/agent/hyper"
 	"github.com/charmbracelet/crush/internal/csync"
 	"github.com/charmbracelet/crush/internal/env"
 	"github.com/charmbracelet/crush/internal/oauth"
 	"github.com/charmbracelet/crush/internal/oauth/claude"
+	"github.com/charmbracelet/crush/internal/oauth/copilot"
+	"github.com/charmbracelet/crush/internal/oauth/hyper"
 	"github.com/invopop/jsonschema"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -95,6 +101,8 @@ type ProviderConfig struct {
 	Type catwalk.Type `json:"type,omitempty" jsonschema:"description=Provider type that determines the API format,enum=openai,enum=openai-compat,enum=anthropic,enum=gemini,enum=azure,enum=vertexai,default=openai"`
 	// The provider's API key.
 	APIKey string `json:"api_key,omitempty" jsonschema:"description=API key for authentication with the provider,example=$OPENAI_API_KEY"`
+	// The original API key template before resolution (for re-resolution on auth errors).
+	APIKeyTemplate string `json:"-"`
 	// OAuthToken for providers that use OAuth2 authentication.
 	OAuthToken *oauth.Token `json:"oauth,omitempty" jsonschema:"description=OAuth2 token for authentication with the provider"`
 	// Marks the provider as disabled.
@@ -117,8 +125,37 @@ type ProviderConfig struct {
 	Models []catwalk.Model `json:"models,omitempty" jsonschema:"description=List of models available from this provider"`
 }
 
+// ToProvider converts the [ProviderConfig] to a [catwalk.Provider].
+func (pc *ProviderConfig) ToProvider() catwalk.Provider {
+	// Convert config provider to provider.Provider format
+	provider := catwalk.Provider{
+		Name:   pc.Name,
+		ID:     catwalk.InferenceProvider(pc.ID),
+		Models: make([]catwalk.Model, len(pc.Models)),
+	}
+
+	// Convert models
+	for i, model := range pc.Models {
+		provider.Models[i] = catwalk.Model{
+			ID:                     model.ID,
+			Name:                   model.Name,
+			CostPer1MIn:            model.CostPer1MIn,
+			CostPer1MOut:           model.CostPer1MOut,
+			CostPer1MInCached:      model.CostPer1MInCached,
+			CostPer1MOutCached:     model.CostPer1MOutCached,
+			ContextWindow:          model.ContextWindow,
+			DefaultMaxTokens:       model.DefaultMaxTokens,
+			CanReason:              model.CanReason,
+			ReasoningLevels:        model.ReasoningLevels,
+			DefaultReasoningEffort: model.DefaultReasoningEffort,
+			SupportsImages:         model.SupportsImages,
+		}
+	}
+
+	return provider
+}
+
 func (pc *ProviderConfig) SetupClaudeCode() {
-	pc.APIKey = fmt.Sprintf("Bearer %s", pc.OAuthToken.AccessToken)
 	pc.SystemPromptPrefix = "You are Claude Code, Anthropic's official CLI for Claude."
 	pc.ExtraHeaders["anthropic-version"] = "2023-06-01"
 
@@ -133,6 +170,10 @@ func (pc *ProviderConfig) SetupClaudeCode() {
 	pc.ExtraHeaders["anthropic-beta"] = value
 }
 
+func (pc *ProviderConfig) SetupGitHubCopilot() {
+	maps.Copy(pc.ExtraHeaders, copilot.Headers())
+}
+
 type MCPType string
 
 const (
@@ -142,13 +183,14 @@ const (
 )
 
 type MCPConfig struct {
-	Command  string            `json:"command,omitempty" jsonschema:"description=Command to execute for stdio MCP servers,example=npx"`
-	Env      map[string]string `json:"env,omitempty" jsonschema:"description=Environment variables to set for the MCP server"`
-	Args     []string          `json:"args,omitempty" jsonschema:"description=Arguments to pass to the MCP server command"`
-	Type     MCPType           `json:"type" jsonschema:"required,description=Type of MCP connection,enum=stdio,enum=sse,enum=http,default=stdio"`
-	URL      string            `json:"url,omitempty" jsonschema:"description=URL for HTTP or SSE MCP servers,format=uri,example=http://localhost:3000/mcp"`
-	Disabled bool              `json:"disabled,omitempty" jsonschema:"description=Whether this MCP server is disabled,default=false"`
-	Timeout  int               `json:"timeout,omitempty" jsonschema:"description=Timeout in seconds for MCP server connections,default=15,example=30,example=60,example=120"`
+	Command       string            `json:"command,omitempty" jsonschema:"description=Command to execute for stdio MCP servers,example=npx"`
+	Env           map[string]string `json:"env,omitempty" jsonschema:"description=Environment variables to set for the MCP server"`
+	Args          []string          `json:"args,omitempty" jsonschema:"description=Arguments to pass to the MCP server command"`
+	Type          MCPType           `json:"type" jsonschema:"required,description=Type of MCP connection,enum=stdio,enum=sse,enum=http,default=stdio"`
+	URL           string            `json:"url,omitempty" jsonschema:"description=URL for HTTP or SSE MCP servers,format=uri,example=http://localhost:3000/mcp"`
+	Disabled      bool              `json:"disabled,omitempty" jsonschema:"description=Whether this MCP server is disabled,default=false"`
+	DisabledTools []string          `json:"disabled_tools,omitempty" jsonschema:"description=List of tools from this MCP server to disable,example=get-library-doc"`
+	Timeout       int               `json:"timeout,omitempty" jsonschema:"description=Timeout in seconds for MCP server connections,default=15,example=30,example=60,example=120"`
 
 	// TODO: maybe make it possible to get the value from the env
 	Headers map[string]string `json:"headers,omitempty" jsonschema:"description=HTTP headers for HTTP/SSE MCP servers"`
@@ -219,7 +261,7 @@ type Options struct {
 	DebugLSP                  bool         `json:"debug_lsp,omitempty" jsonschema:"description=Enable debug logging for LSP servers,default=false"`
 	DisableAutoSummarize      bool         `json:"disable_auto_summarize,omitempty" jsonschema:"description=Disable automatic conversation summarization,default=false"`
 	DataDirectory             string       `json:"data_directory,omitempty" jsonschema:"description=Directory for storing application data (relative to working directory),default=.crush,example=.crush"` // Relative to the cwd
-	DisabledTools             []string     `json:"disabled_tools" jsonschema:"description=Tools to disable"`
+	DisabledTools             []string     `json:"disabled_tools,omitempty" jsonschema:"description=List of built-in tools to disable and hide from the agent,example=bash,example=sourcegraph"`
 	DisableProviderAutoUpdate bool         `json:"disable_provider_auto_update,omitempty" jsonschema:"description=Disable providers auto-update,default=false"`
 	Attribution               *Attribution `json:"attribution,omitempty" jsonschema:"description=Attribution settings for generated content"`
 	DisableMetrics            bool         `json:"disable_metrics,omitempty" jsonschema:"description=Disable sending metrics,default=false"`
@@ -448,8 +490,15 @@ func (c *Config) UpdatePreferredModel(modelType SelectedModelType, model Selecte
 	return nil
 }
 
+func (c *Config) HasConfigField(key string) bool {
+	data, err := os.ReadFile(c.dataConfigDir)
+	if err != nil {
+		return false
+	}
+	return gjson.Get(string(data), key).Exists()
+}
+
 func (c *Config) SetConfigField(key string, value any) error {
-	// read the data
 	data, err := os.ReadFile(c.dataConfigDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -463,12 +512,16 @@ func (c *Config) SetConfigField(key string, value any) error {
 	if err != nil {
 		return fmt.Errorf("failed to set config field %s: %w", key, err)
 	}
+	if err := os.MkdirAll(filepath.Dir(c.dataConfigDir), 0o755); err != nil {
+		return fmt.Errorf("failed to create config directory %q: %w", c.dataConfigDir, err)
+	}
 	if err := os.WriteFile(c.dataConfigDir, []byte(newValue), 0o600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 	return nil
 }
 
+// RefreshOAuthToken refreshes the OAuth token for the given provider.
 func (c *Config) RefreshOAuthToken(ctx context.Context, providerID string) error {
 	providerConfig, exists := c.Providers.Get(providerID)
 	if !exists {
@@ -479,20 +532,32 @@ func (c *Config) RefreshOAuthToken(ctx context.Context, providerID string) error
 		return fmt.Errorf("provider %s does not have an OAuth token", providerID)
 	}
 
-	// Only Anthropic provider uses OAuth for now
-	if providerID != string(catwalk.InferenceProviderAnthropic) {
+	var newToken *oauth.Token
+	var refreshErr error
+	switch providerID {
+	case string(catwalk.InferenceProviderAnthropic):
+		newToken, refreshErr = claude.RefreshToken(ctx, providerConfig.OAuthToken.RefreshToken)
+	case string(catwalk.InferenceProviderCopilot):
+		newToken, refreshErr = copilot.RefreshToken(ctx, providerConfig.OAuthToken.RefreshToken)
+	case hyperp.Name:
+		newToken, refreshErr = hyper.ExchangeToken(ctx, providerConfig.OAuthToken.RefreshToken)
+	default:
 		return fmt.Errorf("OAuth refresh not supported for provider %s", providerID)
 	}
-
-	newToken, err := claude.RefreshToken(ctx, providerConfig.OAuthToken.RefreshToken)
-	if err != nil {
-		return fmt.Errorf("failed to refresh OAuth token for provider %s: %w", providerID, err)
+	if refreshErr != nil {
+		return fmt.Errorf("failed to refresh OAuth token for provider %s: %w", providerID, refreshErr)
 	}
 
-	slog.Info("Successfully refreshed OAuth token in background", "provider", providerID)
+	slog.Info("Successfully refreshed OAuth token", "provider", providerID)
 	providerConfig.OAuthToken = newToken
-	providerConfig.APIKey = fmt.Sprintf("Bearer %s", newToken.AccessToken)
-	providerConfig.SetupClaudeCode()
+	providerConfig.APIKey = newToken.AccessToken
+
+	switch providerID {
+	case string(catwalk.InferenceProviderAnthropic):
+		providerConfig.SetupClaudeCode()
+	case string(catwalk.InferenceProviderCopilot):
+		providerConfig.SetupGitHubCopilot()
+	}
 
 	c.Providers.Set(providerID, providerConfig)
 
@@ -527,7 +592,12 @@ func (c *Config) SetProviderAPIKey(providerID string, apiKey any) error {
 		setKeyOrToken = func() {
 			providerConfig.APIKey = v.AccessToken
 			providerConfig.OAuthToken = v
-			providerConfig.SetupClaudeCode()
+			switch providerID {
+			case string(catwalk.InferenceProviderAnthropic):
+				providerConfig.SetupClaudeCode()
+			case string(catwalk.InferenceProviderCopilot):
+				providerConfig.SetupGitHubCopilot()
+			}
 		}
 	}
 
@@ -627,6 +697,7 @@ func allToolNames() []string {
 		"grep",
 		"ls",
 		"sourcegraph",
+		"todos",
 		"view",
 		"write",
 	}
