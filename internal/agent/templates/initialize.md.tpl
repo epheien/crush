@@ -1,5 +1,7 @@
 Analyze this codebase and create/update **{{.Config.Options.InitializeAs}}** to help future agents work effectively in this repository.
 
+**Important**: Please respond in Chinese and write the file content in Chinese.
+
 **First**: Check if directory is empty or contains only config files. If so, stop and say "Directory appears empty or only contains config. Add source code first, then run this command to generate {{.Config.Options.InitializeAs}}."
 
 **Goal**: Document what an agent needs to know to work in this codebase - commands, patterns, conventions, gotchas.
