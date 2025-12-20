@@ -1339,23 +1339,23 @@ func (p *chatPage) Help() help.KeyMap {
 			)
 		case PanelTypeEditor:
 			newLineBinding := key.NewBinding(
-				key.WithKeys("shift+enter", "ctrl+j"),
-				// "ctrl+j" is a common keybinding for newline in many editors. If
-				// the terminal supports "shift+enter", we substitute the help text
+				key.WithKeys("shift+enter", "ctrl+j", "alt+enter"),
+				// "ctrl+j", "shift+enter" and "alt+enter" are common keybindings for newline in many editors.
+				// If the terminal supports these keys, we substitute the help text
 				// to reflect that.
-				key.WithHelp("ctrl+j", "newline"),
+				key.WithHelp("shift+enter or alt+enter", "newline"),
 			)
 			if p.keyboardEnhancements.Flags > 0 {
 				// Non-zero flags mean we have at least key disambiguation.
-				newLineBinding.SetHelp("shift+enter", newLineBinding.Help().Desc)
+				newLineBinding.SetHelp("shift+enter or alt+enter", newLineBinding.Help().Desc)
 			}
 			shortList = append(shortList, newLineBinding)
 			fullList = append(fullList,
 				[]key.Binding{
 					newLineBinding,
 					key.NewBinding(
-						key.WithKeys("ctrl+f"),
-						key.WithHelp("ctrl+f", "add image"),
+						key.WithKeys("ctrl+t"),
+						key.WithHelp("ctrl+t", "add image"),
 					),
 					key.NewBinding(
 						key.WithKeys("@"),

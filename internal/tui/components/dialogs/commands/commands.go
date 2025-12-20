@@ -410,7 +410,7 @@ func (c *commandDialogCmp) defaultCommands() []Command {
 			commands = append(commands, Command{
 				ID:          "file_picker",
 				Title:       "Open File Picker",
-				Shortcut:    "ctrl+f",
+				Shortcut:    "ctrl+t",
 				Description: "Open file picker",
 				Handler: func(cmd Command) tea.Cmd {
 					return util.CmdHandler(OpenFilePickerMsg{})

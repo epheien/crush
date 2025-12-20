@@ -22,8 +22,8 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("ctrl+n", "new session"),
 		),
 		AddAttachment: key.NewBinding(
-			key.WithKeys("ctrl+f"),
-			key.WithHelp("ctrl+f", "add attachment"),
+			key.WithKeys("ctrl+t"),
+			key.WithHelp("ctrl+t", "add attachment"),
 		),
 		Cancel: key.NewBinding(
 			key.WithKeys("esc", "alt+esc"),
@@ -42,12 +42,12 @@ func DefaultKeyMap() KeyMap {
 			key.WithHelp("ctrl+space", "toggle tasks"),
 		),
 		PillLeft: key.NewBinding(
-			key.WithKeys("left"),
-			key.WithHelp("←/→", "switch section"),
+			key.WithKeys("left", "ctrl+b"),
+			key.WithHelp("←/→ or ctrl+b/f", "switch section"),
 		),
 		PillRight: key.NewBinding(
-			key.WithKeys("right"),
-			key.WithHelp("←/→", "switch section"),
+			key.WithKeys("right", "ctrl+f"),
+			key.WithHelp("←/→ or ctrl+b/f", "switch section"),
 		),
 	}
 }
