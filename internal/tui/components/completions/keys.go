@@ -16,12 +16,12 @@ type KeyMap struct {
 func DefaultKeyMap() KeyMap {
 	return KeyMap{
 		Down: key.NewBinding(
-			key.WithKeys("down"),
-			key.WithHelp("down", "move down"),
+			key.WithKeys("down", "ctrl+n"),
+			key.WithHelp("↓/ctrl+n", "move down"),
 		),
 		Up: key.NewBinding(
-			key.WithKeys("up"),
-			key.WithHelp("up", "move up"),
+			key.WithKeys("up", "ctrl+p"),
+			key.WithHelp("↑/ctrl+p", "move up"),
 		),
 		Select: key.NewBinding(
 			key.WithKeys("enter", "tab", "ctrl+y"),
