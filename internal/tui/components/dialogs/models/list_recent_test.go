@@ -261,6 +261,231 @@ func TestModelList_PrunesInvalidModelWithinValidProvider(t *testing.T) {
 	require.Equal(t, "m1", m["model"])
 }
 
+func TestModelList_NoDuplicateModels(t *testing.T) {
+	// Pre-initialize logger to os.DevNull to prevent file lock on Windows.
+	log.Setup(os.DevNull, false)
+
+	// Isolate config/data paths
+	cfgDir := t.TempDir()
+	dataDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	t.Setenv("XDG_DATA_HOME", dataDir)
+
+	// Pre-seed config with provider that should appear in both unknown and known sections
+	confPath := filepath.Join(cfgDir, "crush", "crush.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(confPath), 0o755))
+	initial := map[string]any{
+		"options": map[string]any{
+			"disable_provider_auto_update": true,
+		},
+		"models": map[string]any{
+			"large": map[string]any{
+				"model":    "gpt-oss-120b",
+				"provider": "gpt-oss",
+			},
+		},
+		"providers": map[string]any{
+			"gpt-oss": map[string]any{
+				"api_key": "$GPT_OSS_API_KEY",
+				"models": []any{
+					map[string]any{"id": "gpt-oss-120b", "name": "GPT OSS 120B"},
+					map[string]any{"id": "qwen3-next", "name": "Qwen3 Next"},
+				},
+			},
+		},
+	}
+	bts, err := json.Marshal(initial)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(confPath, bts, 0o644))
+
+	// Create known providers list that includes gpt-oss
+	dataConfDir := filepath.Join(dataDir, "crush")
+	require.NoError(t, os.MkdirAll(dataConfDir, 0o755))
+	knownProviders := []catwalk.Provider{
+		{
+			ID:   catwalk.InferenceProvider("gpt-oss"),
+			Name: "GPT OSS",
+			Models: []catwalk.Model{
+				{ID: "gpt-oss-120b", Name: "GPT OSS 120B"},
+				{ID: "qwen3-next", Name: "Qwen3 Next"},
+				{ID: "devstral2", Name: "Devstral 2"},
+			},
+		},
+	}
+	providersJSON, _ := json.Marshal(knownProviders)
+	require.NoError(t, os.WriteFile(filepath.Join(dataConfDir, "providers.json"), providersJSON, 0o644))
+
+	// Initialize global config instance
+	_, err = config.Init(cfgDir, dataDir, false)
+	require.NoError(t, err)
+
+	// Create and initialize component with known providers
+	listKeyMap := list.DefaultKeyMap()
+	cmp := NewModelListComponent(listKeyMap, "Find your fave", false)
+	cmp.providers = knownProviders
+	execCmdML(t, cmp, cmp.Init())
+
+	// Get all groups and items to verify no duplicates
+	groups := cmp.list.Groups()
+	require.NotEmpty(t, groups)
+
+	// Collect all item IDs to check for duplicates
+	itemIDs := make(map[string]bool)
+	var allItems []list.CompletionItem[ModelOption]
+
+	for _, g := range groups {
+		for _, item := range g.Items {
+			// Skip recent items as they have different IDs (prefixed with "recent::")
+			if !strings.HasPrefix(item.ID(), "recent::") {
+				allItems = append(allItems, item)
+				// For model items, check the underlying model ID
+				modelID := item.Value().Model.ID
+				providerID := string(item.Value().Provider.ID)
+				fullID := providerID + ":" + modelID
+
+				if itemIDs[fullID] {
+					require.Fail(t, "Duplicate model found", "Model %s appears multiple times in the list", fullID)
+				}
+				itemIDs[fullID] = true
+			}
+		}
+	}
+
+	// Verify we found the expected models without duplicates
+	require.NotEmpty(t, allItems, "Should have model items")
+
+	// Check that at least some expected models are present
+	foundGPTOSS := false
+	foundQwen3 := false
+	for itemID := range itemIDs {
+		if strings.Contains(itemID, "gpt-oss:gpt-oss-120b") {
+			foundGPTOSS = true
+		}
+		if strings.Contains(itemID, "gpt-oss:qwen3-next") {
+			foundQwen3 = true
+		}
+	}
+
+	require.True(t, foundGPTOSS, "Should find GPT OSS 120B model")
+	require.True(t, foundQwen3, "Should find Qwen3 Next model")
+}
+
+func TestModelList_LinuxXDGPaths(t *testing.T) {
+	// Pre-initialize logger to os.DevNull to prevent file lock on Windows.
+	log.Setup(os.DevNull, false)
+
+	// Isolate config/data paths
+	cfgDir := t.TempDir()
+	dataDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgDir)
+	t.Setenv("XDG_DATA_HOME", dataDir)
+
+	// Simulate Linux XDG paths with overlapping provider configurations
+	confPath := filepath.Join(cfgDir, "crush", "crush.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(confPath), 0o755))
+
+	// Create overlapping provider configs (simulating Linux path conflicts)
+	initial := map[string]any{
+		"options": map[string]any{
+			"disable_provider_auto_update": true,
+		},
+		"models": map[string]any{
+			"large": map[string]any{
+				"model":    "gpt-oss-120b",
+				"provider": "gpt-oss",
+			},
+		},
+		"providers": map[string]any{
+			"gpt-oss": map[string]any{
+				"api_key": "$GPT_OSS_API_KEY",
+				"models": []any{
+					map[string]any{"id": "gpt-oss-120b", "name": "GPT OSS 120B"},
+					map[string]any{"id": "qwen3-next", "name": "Qwen3 Next"},
+					map[string]any{"id": "devstral2", "name": "Devstral 2"},
+				},
+			},
+		},
+		"recent_models": map[string]any{
+			"large": []any{
+				map[string]any{"model": "gpt-oss-120b", "provider": "gpt-oss"},
+			},
+		},
+	}
+	bts, err := json.Marshal(initial)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(confPath, bts, 0o644))
+
+	// Create data directory with provider cache (Linux typical scenario)
+	dataConfDir := filepath.Join(dataDir, "crush")
+	require.NoError(t, os.MkdirAll(dataConfDir, 0o755))
+
+	// Create known providers list that overlaps with config providers
+	knownProviders := []catwalk.Provider{
+		{
+			ID:   catwalk.InferenceProvider("gpt-oss"),
+			Name: "GPT OSS",
+			Models: []catwalk.Model{
+				{ID: "gpt-oss-120b", Name: "GPT OSS 120B"},
+				{ID: "qwen3-next", Name: "Qwen3 Next"},
+				{ID: "devstral2", Name: "Devstral 2"},
+				{ID: "intellect3", Name: "Intellect 3"},
+			},
+		},
+		{
+			ID:   catwalk.InferenceProvider("llama.cpp"),
+			Name: "Llama.cpp",
+			Models: []catwalk.Model{
+				{ID: "gpt-oss-120b", Name: "GPT OSS 120B"},
+				{ID: "qwen3-next", Name: "Qwen3 Next"},
+			},
+		},
+	}
+	providersJSON, _ := json.Marshal(knownProviders)
+	require.NoError(t, os.WriteFile(filepath.Join(dataConfDir, "providers.json"), providersJSON, 0o644))
+
+	// Initialize global config instance
+	_, err = config.Init(cfgDir, dataDir, false)
+	require.NoError(t, err)
+
+	// Create and initialize component with known providers
+	listKeyMap := list.DefaultKeyMap()
+	cmp := NewModelListComponent(listKeyMap, "Find your fave", false)
+	cmp.providers = knownProviders
+	execCmdML(t, cmp, cmp.Init())
+
+	// Get all groups and items to verify no duplicates
+	groups := cmp.list.Groups()
+	require.NotEmpty(t, groups)
+
+	// Collect all item IDs to check for duplicates across all sources
+	modelCounts := make(map[string]int)
+	var allItems []list.CompletionItem[ModelOption]
+
+	for _, g := range groups {
+		for _, item := range g.Items {
+			if !strings.HasPrefix(item.ID(), "recent::") {
+				allItems = append(allItems, item)
+				modelID := item.Value().Model.ID
+				providerID := string(item.Value().Provider.ID)
+				fullID := providerID + ":" + modelID
+				modelCounts[fullID]++
+			}
+		}
+	}
+
+	// Verify no duplicate models across all groups
+	require.NotEmpty(t, allItems, "Should have model items")
+
+	// Check that no model appears more than once
+	for modelID, count := range modelCounts {
+		require.Equal(t, 1, count, "Model %s should appear exactly once, found %d times", modelID, count)
+	}
+
+	// Specifically check the overlapping models
+	require.Equal(t, 1, modelCounts["gpt-oss:gpt-oss-120b"], "GPT OSS 120B should appear exactly once")
+	require.Equal(t, 1, modelCounts["gpt-oss:qwen3-next"], "Qwen3 Next should appear exactly once")
+}
+
 func TestModelKey_EmptyInputs(t *testing.T) {
 	// Empty provider
 	require.Equal(t, "", modelKey("", "model"))

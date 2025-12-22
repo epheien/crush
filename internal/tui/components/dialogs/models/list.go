@@ -130,8 +130,9 @@ func (m *ModelListComponent) SetModelType(modelType int) tea.Cmd {
 	configuredIcon := t.S().Base.Foreground(t.Success).Render(styles.CheckIcon)
 	configured := fmt.Sprintf("%s %s", configuredIcon, t.S().Subtle.Render("Configured"))
 
-	// Create a map to track which providers we've already added
+	// Create a map to track which providers and models we've already added
 	addedProviders := make(map[string]bool)
+	addedModels := make(map[string]bool)
 
 	// First, add any configured providers that are not in the known providers list
 	// These should appear at the top of the list
@@ -144,9 +145,10 @@ func (m *ModelListComponent) SetModelType(modelType int) tea.Cmd {
 			continue
 		}
 
-		// Check if this provider is not in the known providers list
-		if !slices.ContainsFunc(knownProviders, func(p catwalk.Provider) bool { return p.ID == catwalk.InferenceProvider(providerID) }) ||
-			!slices.ContainsFunc(m.providers, func(p catwalk.Provider) bool { return p.ID == catwalk.InferenceProvider(providerID) }) {
+		// Check if this provider is truly unknown (not in knownProviders)
+		isKnownProvider := slices.ContainsFunc(knownProviders, func(p catwalk.Provider) bool { return p.ID == catwalk.InferenceProvider(providerID) })
+
+		if !isKnownProvider {
 			// Convert config provider to provider.Provider format
 			configProvider := providerConfig.ToProvider()
 
@@ -171,6 +173,12 @@ func (m *ModelListComponent) SetModelType(modelType int) tea.Cmd {
 					modelOption,
 					list.WithCompletionID(key),
 				)
+
+				// Check if this model is already added to prevent duplicates
+				if addedModels[key] {
+					continue // Skip duplicate model
+				}
+				addedModels[key] = true
 				itemsByKey[key] = item
 
 				group.Items = append(group.Items, item)
@@ -260,7 +268,16 @@ func (m *ModelListComponent) SetModelType(modelType int) tea.Cmd {
 				list.WithCompletionID(key),
 			)
 			itemsByKey[key] = item
+
+			// Check if this item is already in the group to prevent duplicates
+			modelKeyStr := modelKey(string(displayProvider.ID), model.ID)
+			if addedModels[modelKeyStr] {
+				continue // Skip duplicate model
+			}
+			addedModels[modelKeyStr] = true
+
 			group.Items = append(group.Items, item)
+
 			if model.ID == currentModel.Model && string(displayProvider.ID) == currentModel.Provider {
 				selectedItemID = item.ID()
 			}
