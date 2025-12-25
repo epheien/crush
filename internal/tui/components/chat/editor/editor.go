@@ -29,6 +29,7 @@ import (
 	"github.com/charmbracelet/crush/internal/tui/components/dialogs/quit"
 	"github.com/charmbracelet/crush/internal/tui/styles"
 	"github.com/charmbracelet/crush/internal/tui/util"
+	"github.com/rivo/uniseg"
 )
 
 type Editor interface {
@@ -64,9 +65,10 @@ type editorCmp struct {
 	keyMap EditorKeyMap
 
 	// File path completions
-	currentQuery          string
-	completionsStartIndex int
-	isCompletionsOpen     bool
+	currentQuery              string
+	completionsStartIndex     int // Display width for curIdx comparison
+	completionsStartByteIndex int // Byte index for string slicing
+	isCompletionsOpen         bool
 }
 
 var DeleteKeyMaps = DeleteAttachmentKeyMaps{
@@ -195,9 +197,9 @@ func (m *editorCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 			word := m.textarea.Word()
 			// If the selected item is a file, insert its path into the textarea
 			value := m.textarea.Value()
-			value = value[:m.completionsStartIndex] + // Remove the current query
+			value = value[:m.completionsStartByteIndex] + // Remove the current query
 				item.Path + // Insert the file path
-				value[m.completionsStartIndex+len(word):] // Append the rest of the value
+				value[m.completionsStartByteIndex+len(word):] // Append the rest of the value
 			// XXX: This will always move the cursor to the end of the textarea.
 			m.textarea.SetValue(value)
 			m.textarea.MoveToEnd()
@@ -205,6 +207,7 @@ func (m *editorCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 				m.isCompletionsOpen = false
 				m.currentQuery = ""
 				m.completionsStartIndex = 0
+				m.completionsStartByteIndex = 0
 			}
 		}
 
@@ -273,6 +276,7 @@ func (m *editorCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 			m.isCompletionsOpen = true
 			m.currentQuery = ""
 			m.completionsStartIndex = curIdx
+			m.completionsStartByteIndex = curIdx // Initially same when no multi-byte chars before
 			cmds = append(cmds, m.startCompletions)
 		case m.isCompletionsOpen && curIdx <= m.completionsStartIndex:
 			cmds = append(cmds, util.CmdHandler(completions.CloseCompletionsMsg{}))
@@ -341,7 +345,17 @@ func (m *editorCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 				word := m.textarea.Word()
 				if strings.HasPrefix(word, "@") {
 					// XXX: wont' work if editing in the middle of the field.
-					m.completionsStartIndex = strings.LastIndex(m.textarea.Value(), word)
+					// Calculate the index of the word by computing the display width
+					// of the text before the word.
+					fullText := m.textarea.Value()
+					wordByteIdx := strings.LastIndex(fullText, word)
+					// Use display width instead of byte index to handle multi-byte
+					// characters like Chinese correctly.
+					m.completionsStartIndex = uniseg.StringWidth(fullText[:wordByteIdx])
+					// Store byte index for string slicing operations.
+					m.completionsStartByteIndex = wordByteIdx
+					// Calculate display width for curIdx comparison to handle
+					// multi-byte characters like Chinese correctly.
 					m.currentQuery = word[1:]
 					x, y := m.completionsPosition()
 					x -= len(m.currentQuery)
