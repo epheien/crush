@@ -2,6 +2,7 @@ package editor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 	"github.com/charmbracelet/crush/internal/tui/styles"
 	"github.com/charmbracelet/crush/internal/tui/util"
 	"github.com/rivo/uniseg"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type Editor interface {
@@ -86,10 +88,7 @@ var DeleteKeyMaps = DeleteAttachmentKeyMaps{
 	),
 }
 
-const (
-	maxAttachments = 5
-	maxFileResults = 25
-)
+const maxFileResults = 25
 
 type OpenEditorMsg struct {
 	Text string
@@ -147,14 +146,14 @@ func (m *editorCmp) send() tea.Cmd {
 		return util.CmdHandler(dialogs.OpenDialogMsg{Model: quit.NewQuitDialog()})
 	}
 
-	m.textarea.Reset()
 	attachments := m.attachments
 
-	m.attachments = nil
 	if value == "" {
 		return nil
 	}
 
+	m.textarea.Reset()
+	m.attachments = nil
 	// Change the placeholder when sending a new message.
 	m.randomizePlaceholders()
 
@@ -178,9 +177,6 @@ func (m *editorCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		return m, m.repositionCompletions
 	case filepicker.FilePickedMsg:
-		if len(m.attachments) >= maxAttachments {
-			return m, util.ReportError(fmt.Errorf("cannot add more than %d images", maxAttachments))
-		}
 		m.attachments = append(m.attachments, msg.Attachment)
 		return m, nil
 	case completions.CompletionsOpenedMsg:
@@ -209,6 +205,17 @@ func (m *editorCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 				m.completionsStartIndex = 0
 				m.completionsStartByteIndex = 0
 			}
+			content, err := os.ReadFile(item.Path)
+			if err != nil {
+				// if it fails, let the LLM handle it later.
+				return m, nil
+			}
+			m.attachments = append(m.attachments, message.Attachment{
+				FilePath: item.Path,
+				FileName: filepath.Base(item.Path),
+				MimeType: mimeOf(content),
+				Content:  content,
+			})
 		}
 
 	case commands.OpenExternalEditorMsg:
@@ -220,39 +227,29 @@ func (m *editorCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 		m.textarea.SetValue(msg.Text)
 		m.textarea.MoveToEnd()
 	case tea.PasteMsg:
-		path := strings.ReplaceAll(msg.Content, "\\ ", " ")
-		// try to get an image
-		path, err := filepath.Abs(strings.TrimSpace(path))
+		content, path, err := pasteToFile(msg)
+		if errors.Is(err, errNotAFile) {
+			m.textarea, cmd = m.textarea.Update(msg)
+			return m, cmd
+		}
 		if err != nil {
-			m.textarea, cmd = m.textarea.Update(msg)
-			return m, cmd
-		}
-		isAllowedType := false
-		for _, ext := range filepicker.AllowedTypes {
-			if strings.HasSuffix(path, ext) {
-				isAllowedType = true
-				break
-			}
-		}
-		if !isAllowedType {
-			m.textarea, cmd = m.textarea.Update(msg)
-			return m, cmd
-		}
-		tooBig, _ := filepicker.IsFileTooBig(path, filepicker.MaxAttachmentSize)
-		if tooBig {
-			m.textarea, cmd = m.textarea.Update(msg)
-			return m, cmd
+			return m, util.ReportError(err)
 		}
 
-		content, err := os.ReadFile(path)
-		if err != nil {
-			m.textarea, cmd = m.textarea.Update(msg)
-			return m, cmd
+		if len(content) > maxAttachmentSize {
+			return m, util.ReportWarn("File is too big (>5mb)")
 		}
-		mimeBufferSize := min(512, len(content))
-		mimeType := http.DetectContentType(content[:mimeBufferSize])
-		fileName := filepath.Base(path)
-		attachment := message.Attachment{FilePath: path, FileName: fileName, MimeType: mimeType, Content: content}
+
+		mimeType := mimeOf(content)
+		attachment := message.Attachment{
+			FilePath: path,
+			FileName: filepath.Base(path),
+			MimeType: mimeType,
+			Content:  content,
+		}
+		if !attachment.IsText() && !attachment.IsImage() {
+			return m, util.ReportWarn("Invalid file content type: " + mimeType)
+		}
 		return m, util.CmdHandler(filepicker.FilePickedMsg{
 			Attachment: attachment,
 		})
@@ -441,18 +438,17 @@ func (m *editorCmp) View() string {
 		m.textarea.Placeholder = "Yolo mode!"
 	}
 	if len(m.attachments) == 0 {
-		content := t.S().Base.Padding(1).Render(
+		return t.S().Base.Padding(1).Render(
 			m.textarea.View(),
 		)
-		return content
 	}
-	content := t.S().Base.Padding(0, 1, 1, 1).Render(
-		lipgloss.JoinVertical(lipgloss.Top,
+	return t.S().Base.Padding(0, 1, 1, 1).Render(
+		lipgloss.JoinVertical(
+			lipgloss.Top,
 			m.attachmentsContent(),
 			m.textarea.View(),
 		),
 	)
-	return content
 }
 
 func (m *editorCmp) SetSize(width, height int) tea.Cmd {
@@ -470,24 +466,45 @@ func (m *editorCmp) GetSize() (int, int) {
 func (m *editorCmp) attachmentsContent() string {
 	var styledAttachments []string
 	t := styles.CurrentTheme()
-	attachmentStyles := t.S().Base.
-		MarginLeft(1).
+	attachmentStyle := t.S().Base.
+		Padding(0, 1).
+		MarginRight(1).
 		Background(t.FgMuted).
-		Foreground(t.FgBase)
+		Foreground(t.FgBase).
+		Render
+	iconStyle := t.S().Base.
+		Foreground(t.BgSubtle).
+		Background(t.Green).
+		Padding(0, 1).
+		Bold(true).
+		Render
+	rmStyle := t.S().Base.
+		Padding(0, 1).
+		Bold(true).
+		Background(t.Red).
+		Foreground(t.FgBase).
+		Render
 	for i, attachment := range m.attachments {
-		var filename string
-		if len(attachment.FileName) > 10 {
-			filename = fmt.Sprintf(" %s %s...", styles.DocumentIcon, attachment.FileName[0:7])
-		} else {
-			filename = fmt.Sprintf(" %s %s", styles.DocumentIcon, attachment.FileName)
+		filename := ansi.Truncate(filepath.Base(attachment.FileName), 10, "...")
+		icon := styles.ImageIcon
+		if attachment.IsText() {
+			icon = styles.TextIcon
 		}
 		if m.deleteMode {
-			filename = fmt.Sprintf("%d%s", i, filename)
+			styledAttachments = append(
+				styledAttachments,
+				rmStyle(fmt.Sprintf("%d", i)),
+				attachmentStyle(filename),
+			)
+			continue
 		}
-		styledAttachments = append(styledAttachments, attachmentStyles.Render(filename))
+		styledAttachments = append(
+			styledAttachments,
+			iconStyle(icon),
+			attachmentStyle(filename),
+		)
 	}
-	content := lipgloss.JoinHorizontal(lipgloss.Left, styledAttachments...)
-	return content
+	return lipgloss.JoinHorizontal(lipgloss.Left, styledAttachments...)
 }
 
 func (m *editorCmp) SetPosition(x, y int) tea.Cmd {
@@ -610,4 +627,52 @@ func New(app *app.App) Editor {
 	e.textarea.Placeholder = e.readyPlaceholder
 
 	return e
+}
+
+var maxAttachmentSize = 5 * 1024 * 1024 // 5MB
+
+var errNotAFile = errors.New("not a file")
+
+func pasteToFile(msg tea.PasteMsg) ([]byte, string, error) {
+	content, path, err := filepathToFile(msg.Content)
+	if err == nil {
+		return content, path, err
+	}
+
+	if strings.Count(msg.Content, "\n") > 2 {
+		return contentToFile([]byte(msg.Content))
+	}
+
+	return nil, "", errNotAFile
+}
+
+func contentToFile(content []byte) ([]byte, string, error) {
+	f, err := os.CreateTemp("", "paste_*.txt")
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := f.Write(content); err != nil {
+		return nil, "", err
+	}
+	if err := f.Close(); err != nil {
+		return nil, "", err
+	}
+	return content, f.Name(), nil
+}
+
+func filepathToFile(name string) ([]byte, string, error) {
+	path, err := filepath.Abs(strings.TrimSpace(strings.ReplaceAll(name, "\\", "")))
+	if err != nil {
+		return nil, "", err
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	return content, path, nil
+}
+
+func mimeOf(content []byte) string {
+	mimeBufferSize := min(512, len(content))
+	return http.DetectContentType(content[:mimeBufferSize])
 }
