@@ -438,11 +438,11 @@ func (m *editorCmp) View() string {
 		m.textarea.Placeholder = "Yolo mode!"
 	}
 	if len(m.attachments) == 0 {
-		return t.S().Base.Padding(1).Render(
+		return t.S().Base.Padding(1, 1, 0, 1).Render(
 			m.textarea.View(),
 		)
 	}
-	return t.S().Base.Padding(0, 1, 1, 1).Render(
+	return t.S().Base.Padding(0, 1, 0, 1).Render(
 		lipgloss.JoinVertical(
 			lipgloss.Top,
 			m.attachmentsContent(),

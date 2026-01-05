@@ -59,7 +59,7 @@ func (m *statusCmp) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 
 func (m *statusCmp) View() string {
 	t := styles.CurrentTheme()
-	status := t.S().Base.Padding(0, 1, 1, 1).Render(m.help.View(m.keyMap))
+	status := t.S().Base.Padding(0, 1, 0, 1).Render(m.help.View(m.keyMap))
 	if m.info.Msg != "" {
 		status = m.infoMsg()
 	}

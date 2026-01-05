@@ -428,9 +428,9 @@ func (a *appModel) handleWindowResize(width, height int) tea.Cmd {
 
 	// TODO: clean up these magic numbers.
 	if a.showingFullHelp {
-		height -= 5
+		height -= 3
 	} else {
-		height -= 2
+		height -= 0
 	}
 
 	a.width, a.height = width, height

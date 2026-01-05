@@ -70,7 +70,7 @@ const (
 const (
 	CompactModeWidthBreakpoint  = 120 // Width at which the chat page switches to compact mode
 	CompactModeHeightBreakpoint = 30  // Height at which the chat page switches to compact mode
-	EditorHeight                = 5   // Height of the editor input area including padding
+	EditorHeight                = 4   // Height of the editor input area including padding
 	SideBarWidth                = 31  // Width of the sidebar
 	SideBarDetailsPadding       = 1   // Padding for the sidebar details section
 	HeaderHeight                = 1   // Height of the header
