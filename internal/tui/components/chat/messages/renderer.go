@@ -241,7 +241,7 @@ type bashRenderer struct {
 func (br bashRenderer) Render(v *toolCallCmp) string {
 	var params tools.BashParams
 	if err := br.unmarshalParams(v.call.Input, &params); err != nil {
-		return br.renderError(v, "Invalid bash parameters")
+		return br.renderError(v, fmt.Sprintf("Invalid bash parameters: %s", err))
 	}
 
 	cmd := strings.ReplaceAll(params.Command, "\n", " ")
@@ -341,7 +341,7 @@ type bashOutputRenderer struct {
 func (bor bashOutputRenderer) Render(v *toolCallCmp) string {
 	var params tools.JobOutputParams
 	if err := bor.unmarshalParams(v.call.Input, &params); err != nil {
-		return bor.renderError(v, "Invalid job_output parameters")
+		return bor.renderError(v, fmt.Sprintf("Invalid job_output parameters: %s", err))
 	}
 
 	var meta tools.JobOutputResponseMetadata
@@ -384,7 +384,7 @@ type bashKillRenderer struct {
 func (bkr bashKillRenderer) Render(v *toolCallCmp) string {
 	var params tools.JobKillParams
 	if err := bkr.unmarshalParams(v.call.Input, &params); err != nil {
-		return bkr.renderError(v, "Invalid job_kill parameters")
+		return bkr.renderError(v, fmt.Sprintf("Invalid job_kill parameters: %s", err))
 	}
 
 	var meta tools.JobKillResponseMetadata
@@ -427,7 +427,7 @@ type viewRenderer struct {
 func (vr viewRenderer) Render(v *toolCallCmp) string {
 	var params tools.ViewParams
 	if err := vr.unmarshalParams(v.call.Input, &params); err != nil {
-		return vr.renderError(v, "Invalid view parameters")
+		return vr.renderError(v, fmt.Sprintf("Invalid view parameters: %s", err))
 	}
 
 	file := fsext.PrettyPath(params.FilePath)
