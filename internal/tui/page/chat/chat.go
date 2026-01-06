@@ -521,7 +521,9 @@ func (p *chatPage) Update(msg tea.Msg) (util.Model, tea.Cmd) {
 }
 
 func (p *chatPage) Cursor() *tea.Cursor {
-	if p.header.ShowingDetails() {
+	// Hide cursor when showing details in non-compact mode (sidebar on the right)
+	// but not in compact mode (sidebar at top)
+	if p.showingDetails && !p.compact {
 		return nil
 	}
 	switch p.focusedPane {
